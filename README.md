@@ -1,4 +1,4 @@
-# Painel de desempenho — YouTube + X
+# Metrics_LES — Painel de desempenho (YouTube + X)
 
 Protótipo local que coleta seus próprios posts pelas APIs oficiais, guarda tudo em SQLite e
 responde três perguntas:
@@ -48,7 +48,7 @@ copy .env.example .env
 
 ```powershell
 .venv\Scripts\python.exe scripts\init_db.py --demo
-.venv\Scripts\streamlit.exe run src\dashboard.py
+.venv\Scripts\python.exe -m streamlit run src\dashboard.py
 ```
 
 Abre em <http://localhost:8501>. Para limpar depois: `python scripts\init_db.py --reset`.
@@ -120,7 +120,7 @@ isso é esperado: copie a URL completa da barra de endereços e cole no terminal
 .venv\Scripts\python.exe scripts\init_db.py --reset    # zera e recria
 .venv\Scripts\python.exe scripts\collect.py all        # YouTube + X
 .venv\Scripts\python.exe -m pytest -q                  # testes
-.venv\Scripts\streamlit.exe run src\dashboard.py       # painel
+.venv\Scripts\python.exe -m streamlit run src\dashboard.py       # painel
 ```
 
 ---

@@ -24,7 +24,7 @@ from src.analysis.timing import (
 )
 from src.db import connect
 
-st.set_page_config(page_title="Painel de Redes", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Metrics_LES", page_icon="📊", layout="wide")
 
 
 @st.cache_data(ttl=60)
@@ -47,7 +47,7 @@ def _traffic(platform: str, dimension: str) -> pd.DataFrame:
     return traffic_shares(connect(), platform, dimension)
 
 
-st.title("📊 Painel de desempenho")
+st.title("📊 Metrics_LES")
 st.caption("Dados das APIs oficiais · análise local · nada sai da sua máquina")
 
 
