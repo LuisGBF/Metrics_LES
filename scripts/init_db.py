@@ -20,17 +20,29 @@ from src.db import (
     connect,
     upsert_post,
 )
+from src.profiles import get_or_create_profile
 
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def seed_youtube(conn, n: int = 100, days: int = 240, seed: int = 42) -> None:
+def seed_youtube(
+    conn,
+    n: int = 100,
+    days: int = 240,
+    seed: int = 42,
+    handle: str = "demo",
+    label: str = "Canal demo",
+    mode: str = "owned",
+    public: bool = False,
+    followers: float = 2400.0,
+) -> None:
     rng = np.random.default_rng(seed)
     now = datetime.now(timezone.utc)
-    followers = 2400.0
-    add_account_snapshot(conn, "youtube", followers=int(followers), posts_count=n)
+    profile = get_or_create_profile(conn, "youtube", handle, mode=mode, label=label)
+    profile_id = profile["id"]
+    add_account_snapshot(conn, "youtube", profile_id=profile_id, followers=int(followers), posts_count=n)
 
     hour_weight = np.array(
         [0.2, 0.1, 0.1, 0.1, 0.2, 0.4, 0.8, 1.4, 1.8, 1.6, 1.4, 1.5,
@@ -57,11 +69,12 @@ def seed_youtube(conn, n: int = 100, days: int = 240, seed: int = 42) -> None:
         comments = int(views * rng.uniform(0.001, 0.004))
         shares = int(views * rng.uniform(0.0005, 0.002))
 
-        vid = f"DEMO{i:04d}"
+        vid = f"DEMO-{handle}-{i:04d}"
         upsert_post(
             conn,
             {
                 "id": f"youtube:{vid}",
+                "profile_id": profile_id,
                 "platform": "youtube",
                 "platform_id": vid,
                 "posted_at": _iso(posted),
@@ -70,27 +83,40 @@ def seed_youtube(conn, n: int = 100, days: int = 240, seed: int = 42) -> None:
                 "text": "Conteudo sintetico gerado para demonstracao.",
                 "url": f"https://youtu.be/{vid}",
                 "duration_s": int(rng.integers(30, 60)) if is_short else int(rng.integers(300, 1200)),
-                "extra": {"demo": True},
+                "extra": {"demo": True, "mode": mode},
             },
         )
+
+        metrics: dict[str, object] = {
+            "views": views,
+            "likes": likes,
+            "comments": comments,
+            "shares": shares,
+            "followers": int(followers),
+            "raw": {"demo": True},
+        }
+        if not public:
+            # Dados que a API publica nao entrega.
+            metrics.update(
+                {
+                    "impressions": int(views * rng.uniform(6, 12)),
+                    "watch_time_s": int(views * rng.uniform(20, 90)),
+                    "avg_view_duration_s": float(rng.uniform(15, 80)),
+                    "avg_view_percentage": float(rng.uniform(25, 60)),
+                    "ctr": float(rng.uniform(0.02, 0.09)),
+                    "subscribers_gained": int(views * 0.004),
+                    "subscribers_lost": int(views * 0.0005),
+                }
+            )
         add_metric_snapshot(
             conn,
             f"youtube:{vid}",
             collected_at=_iso(min(now, posted + timedelta(days=7))),
-            views=views,
-            impressions=int(views * rng.uniform(6, 12)),
-            likes=likes,
-            comments=comments,
-            shares=shares,
-            watch_time_s=int(views * rng.uniform(20, 90)),
-            avg_view_duration_s=float(rng.uniform(15, 80)),
-            avg_view_percentage=float(rng.uniform(25, 60)),
-            ctr=float(rng.uniform(0.02, 0.09)),
-            subscribers_gained=int(views * 0.004),
-            subscribers_lost=int(views * 0.0005),
-            followers=int(followers),
-            raw={"demo": True},
+            **metrics,
         )
+
+        if public:
+            continue
         add_breakdown(
             conn,
             f"youtube:{vid}",
@@ -113,15 +139,42 @@ def seed_youtube(conn, n: int = 100, days: int = 240, seed: int = 42) -> None:
             },
         )
 
-    add_audience(conn, "youtube", "hour", {str(h): float(w) for h, w in enumerate(hour_weight)})
-    add_audience(conn, "youtube", "weekday", {str(d): float(w) for d, w in enumerate(weekday_weight)})
+    if public:
+        return
+    add_audience(
+        conn,
+        "youtube",
+        "hour",
+        {str(h): float(w) for h, w in enumerate(hour_weight)},
+        profile_id=profile_id,
+    )
+    add_audience(
+        conn,
+        "youtube",
+        "weekday",
+        {str(d): float(w) for d, w in enumerate(weekday_weight)},
+        profile_id=profile_id,
+    )
 
 
-def seed_x(conn, n: int = 80, days: int = 240, seed: int = 7) -> None:
+def seed_x(
+    conn,
+    n: int = 80,
+    days: int = 240,
+    seed: int = 7,
+    handle: str = "demo",
+    label: str = "Perfil demo",
+    mode: str = "owned",
+    public: bool = False,
+    followers: int = 1500,
+) -> None:
     rng = np.random.default_rng(seed)
     now = datetime.now(timezone.utc)
-    followers = 1500
-    add_account_snapshot(conn, "x", followers=followers, following=420, posts_count=n + 900)
+    profile = get_or_create_profile(conn, "x", handle, mode=mode, label=label)
+    profile_id = profile["id"]
+    add_account_snapshot(
+        conn, "x", profile_id=profile_id, followers=followers, following=420, posts_count=n + 900
+    )
 
     for i in range(n):
         offset_days = float(rng.uniform(0, days))
@@ -135,28 +188,30 @@ def seed_x(conn, n: int = 80, days: int = 240, seed: int = 7) -> None:
         reposts = int(impressions * rng.uniform(0.0005, 0.004))
         bookmarks = int(impressions * rng.uniform(0.0005, 0.002))
 
-        tweet_id = f"DEMO{i:04d}"
+        tweet_id = f"DEMO-{handle}-{i:04d}"
         upsert_post(
             conn,
             {
                 "id": f"x:{tweet_id}",
+                "profile_id": profile_id,
                 "platform": "x",
                 "platform_id": tweet_id,
                 "posted_at": _iso(posted),
                 "format": "tweet",
                 "title": None,
                 "text": f"Post de exemplo {i + 1}",
-                "url": f"https://x.com/exemplo/status/{tweet_id}",
+                "url": f"https://x.com/{handle}/status/{tweet_id}",
                 "duration_s": None,
-                "extra": {"demo": True},
+                "extra": {"demo": True, "mode": mode},
             },
         )
         add_metric_snapshot(
             conn,
             f"x:{tweet_id}",
             collected_at=_iso(min(now, posted + timedelta(days=3))),
-            views=impressions,
-            impressions=impressions,
+            # Metricas de impressao/views so existem para a propria conta.
+            views=None if public else impressions,
+            impressions=None if public else impressions,
             likes=likes,
             comments=replies,
             shares=reposts,
@@ -184,10 +239,33 @@ def main() -> None:
     print(f"[db] pronto em {DB_PATH}")
 
     if args.demo:
+        # Dois perfis proprios (dados completos) e dois publicos (so metricas publicas).
         seed_youtube(conn)
+        seed_youtube(
+            conn,
+            n=35,
+            days=200,
+            seed=99,
+            handle="canal_publico_demo",
+            label="Canal publico (demo)",
+            mode="public",
+            public=True,
+            followers=18000.0,
+        )
         seed_x(conn)
+        seed_x(
+            conn,
+            n=40,
+            days=200,
+            seed=13,
+            handle="perfil_publico_demo",
+            label="Perfil publico (demo)",
+            mode="public",
+            public=True,
+            followers=7200,
+        )
         conn.commit()
-        print("[db] dados de demonstracao inseridos (youtube + x)")
+        print("[db] dados de demonstracao inseridos (2 perfis proprios + 2 publicos)")
     conn.close()
 
 

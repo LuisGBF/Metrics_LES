@@ -75,6 +75,7 @@ def traffic_shares(
     conn: sqlite3.Connection,
     platform: str = "youtube",
     dimension: str = "insightTrafficSourceType",
+    profile_id: str | None = None,
     last_n: int = 5,
     baseline_n: int = 20,
 ) -> pd.DataFrame:
@@ -90,9 +91,12 @@ def traffic_shares(
         GROUP BY post_id
     ) latest ON latest.post_id = b.post_id AND latest.collected_at = b.collected_at
     WHERE b.dimension = :dimension AND p.platform = :platform
+      AND (:profile_id IS NULL OR p.profile_id = :profile_id)
     """
     raw = pd.read_sql_query(
-        query, conn, params={"dimension": dimension, "platform": platform}
+        query,
+        conn,
+        params={"dimension": dimension, "platform": platform, "profile_id": profile_id},
     )
     if raw.empty:
         return pd.DataFrame(columns=["bucket", "share_recent", "share_baseline", "delta"])
@@ -124,8 +128,12 @@ def traffic_shares(
     return table.sort_values("share_recent", ascending=False).reset_index()
 
 
-def shadowban_report(conn: sqlite3.Connection, platform: str = "youtube") -> dict[str, object]:
-    posts = load_posts(conn, platform)
+def shadowban_report(
+    conn: sqlite3.Connection,
+    platform: str = "youtube",
+    profile_id: str | None = None,
+) -> dict[str, object]:
+    posts = load_posts(conn, platform, profile_id)
     if posts.empty:
         return {
             "score": 0,
@@ -159,7 +167,7 @@ def shadowban_report(conn: sqlite3.Connection, platform: str = "youtube") -> dic
         )
 
     if platform == "youtube":
-        non_sub = traffic_shares(conn, platform, dimension="subscribedStatus")
+        non_sub = traffic_shares(conn, platform, dimension="subscribedStatus", profile_id=profile_id)
         if not non_sub.empty:
             row = non_sub[non_sub["bucket"] == "NOT_SUBSCRIBED"]
             if not row.empty:
@@ -182,7 +190,9 @@ def shadowban_report(conn: sqlite3.Connection, platform: str = "youtube") -> dic
                         }
                     )
 
-        traffic = traffic_shares(conn, platform, dimension="insightTrafficSourceType")
+        traffic = traffic_shares(
+            conn, platform, dimension="insightTrafficSourceType", profile_id=profile_id
+        )
         if not traffic.empty:
             keys = ["BROWSE", "SUGGESTED_VIDEO", "YT_SEARCH"]
             subset = traffic[traffic["bucket"].isin(keys)]

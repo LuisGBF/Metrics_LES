@@ -71,30 +71,50 @@ def best_slots(slots: pd.DataFrame, top: int = 6) -> pd.DataFrame:
     return slots.sort_values(["ci_low", "n"], ascending=False).head(top).reset_index(drop=True)
 
 
-def audience_profile(conn: sqlite3.Connection, platform: str | None = None) -> dict[str, pd.Series]:
-    """Distribuicao de audiencia ativa por hora e por dia da semana."""
+def audience_profile(
+    conn: sqlite3.Connection,
+    platform: str | None = None,
+    profile_id: str | None = None,
+) -> dict[str, pd.Series]:
+    """Distribuicao de audiencia ativa por hora e por dia da semana.
+
+    Usa todos os buckets do snapshot mais recente de cada perfil. Quando varios
+    perfis entram no filtro, cada um e normalizado antes de tirar a media (somar
+    publicos diferentes distorceria a estimativa).
+    """
     query = """
-    SELECT platform, dimension, bucket, value, collected_at
+    SELECT profile_id, platform, dimension, bucket, value, collected_at
     FROM audience_snapshots
     WHERE (:platform IS NULL OR platform = :platform)
+      AND (:profile_id IS NULL OR profile_id = :profile_id)
     """
-    raw = pd.read_sql_query(query, conn, params={"platform": platform})
+    raw = pd.read_sql_query(query, conn, params={"platform": platform, "profile_id": profile_id})
     result: dict[str, pd.Series] = {}
     if raw.empty:
         return result
 
-    latest = raw.sort_values("collected_at").groupby(["platform", "dimension"], as_index=False).last()
+    raw["profile_id"] = raw["profile_id"].fillna("sem_perfil")
+    latest_stamp = raw.groupby(["profile_id", "dimension"])["collected_at"].transform("max")
+    latest = raw[raw["collected_at"] == latest_stamp]
 
     for dimension, index in (("hour", range(24)), ("weekday", range(7))):
         subset = latest[latest["dimension"] == dimension]
         if subset.empty:
             continue
-        series = subset.groupby("bucket")["value"].sum()
-        series.index = series.index.astype(int)
-        series = series.reindex(index).fillna(0.0)
-        total = float(series.sum())
-        if total > 0:
-            result[dimension] = series / total
+
+        normalized: list[pd.Series] = []
+        for _, group in subset.groupby("profile_id"):
+            series = group.groupby("bucket")["value"].sum()
+            series.index = pd.to_numeric(series.index, errors="coerce")
+            series = series[series.index.notna()]
+            series.index = series.index.astype(int)
+            series = series.reindex(index).fillna(0.0)
+            total = float(series.sum())
+            if total > 0:
+                normalized.append(series / total)
+
+        if normalized:
+            result[dimension] = pd.concat(normalized, axis=1).mean(axis=1)
     return result
 
 

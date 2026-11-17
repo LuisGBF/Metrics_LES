@@ -21,6 +21,7 @@ from ..db import (
     connect,
     upsert_post,
 )
+from ..profiles import YOUTUBE_CHANNEL_ID, get_or_create_profile, normalize_handle
 
 SCOPES = [
     "https://www.googleapis.com/auth/yt-analytics.readonly",
@@ -29,7 +30,7 @@ SCOPES = [
 
 TOKEN_PATH = SECRETS_DIR / "youtube_token.json"
 CLIENT_SECRET_PATH = SECRETS_DIR / "client_secret.json"
-CHANNEL_HANDLE = env("YT_CHANNEL_HANDLE")
+DEFAULT_HANDLE = env("YT_CHANNEL_HANDLE")
 
 CORE_METRICS = (
     "views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,"
@@ -95,6 +96,16 @@ def get_credentials() -> Credentials:
     return creds
 
 
+def _public_client() -> Any:
+    api_key = env("YT_API_KEY")
+    if not api_key:
+        raise SystemExit(
+            "Para analisar outro canal defina YT_API_KEY no .env "
+            "(console.cloud.google.com -> Credenciais -> Chave de API)."
+        )
+    return build("youtube", "v3", developerKey=api_key, cache_discovery=False)
+
+
 def _int(value: Any) -> int | None:
     try:
         return int(value)
@@ -114,6 +125,7 @@ def _query_all(
     rows: list[list[Any]] = []
     headers: list[dict[str, Any]] = []
     start_index = 1
+    supports_paging = True
     while True:
         params = dict(
             ids="channel==MINE",
@@ -122,12 +134,16 @@ def _query_all(
             metrics=metrics,
             dimensions=dimensions,
             maxResults=min(max_rows, 200),
-            startIndex=start_index,
         )
+        if supports_paging:
+            params["startIndex"] = start_index
         try:
             response = analytics.reports().query(**params).execute()
         except TypeError:
-            params.pop("startIndex")
+            # Versao da lib/API sem startIndex: desliga a paginacao em vez de
+            # repetir a mesma pagina ate o limite.
+            supports_paging = False
+            params.pop("startIndex", None)
             response = analytics.reports().query(**params).execute()
         except HttpError as error:
             if start_index > 1:
@@ -137,7 +153,7 @@ def _query_all(
         headers = response.get("columnHeaders", []) or headers
         batch = response.get("rows", []) or []
         rows.extend(batch)
-        if len(batch) < params["maxResults"]:
+        if not supports_paging or len(batch) < params["maxResults"]:
             break
         start_index += params["maxResults"]
         if start_index > 5000:
@@ -167,37 +183,200 @@ def _fetch_video_ids(youtube: Any, uploads: str, limit: int | None) -> list[str]
     return ids[:limit] if limit else ids
 
 
+def _resolve_channel(youtube: Any, handle: str) -> dict[str, Any]:
+    """Descobre o canal publico a partir de @handle, URL, username legado ou ID."""
+    normalized = normalize_handle("youtube", handle)
+    if YOUTUBE_CHANNEL_ID.fullmatch(normalized):
+        response = youtube.channels().list(
+            part="snippet,contentDetails,statistics", id=normalized
+        ).execute()
+    else:
+        response = youtube.channels().list(
+            part="snippet,contentDetails,statistics", forHandle=normalized
+        ).execute()
+        if not response.get("items"):
+            response = youtube.channels().list(
+                part="snippet,contentDetails,statistics", forUsername=normalized
+            ).execute()
+
+    items = response.get("items") or []
+    if not items:
+        raise SystemExit(
+            f"Canal '{handle}' nao encontrado. Confira o @handle, a URL ou o ID (UC...)."
+        )
+    return items[0]
+
+
 def collect(
+    handle: str | None = None,
+    mode: str = "auto",
     limit: int | None = None,
     db_path: str | Path | None = None,
     verbose: bool = True,
-) -> dict[str, int]:
+) -> dict[str, Any]:
+    """Coleta o canal.
+
+    - `owned`/auto sem handle: OAuth, com metricas privadas (impressoes, CTR, audiencia).
+    - `public`/auto com handle: API key, somente dados publicos do canal informado.
+    """
+    if mode not in ("auto", "owned", "public"):
+        raise ValueError(f"Modo invalido: {mode!r}. Use 'auto', 'owned' ou 'public'.")
+
+    use_public = mode == "public" or (
+        mode == "auto" and handle not in (None, "", "me", "own")
+    )
+    if use_public:
+        return _collect_public(handle or DEFAULT_HANDLE, limit=limit, db_path=db_path, verbose=verbose)
+    if handle not in (None, "", "me", "own") and mode == "owned" and verbose:
+        print(
+            "[youtube] modo owned ignora --profile: o OAuth so le o canal da conta autorizada."
+        )
+    return _collect_owned(limit=limit, db_path=db_path, verbose=verbose)
+
+
+def _collect_public(
+    handle: str | None,
+    limit: int | None = None,
+    db_path: str | Path | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    if not handle:
+        raise SystemExit(
+            "Informe --profile @canal (ou defina YT_CHANNEL_HANDLE no .env) "
+            "para coletar um canal publico."
+        )
+
+    youtube = _public_client()
+    channel = _resolve_channel(youtube, handle)
+    channel_id = channel["id"]
+    snippet = channel.get("snippet", {})
+    stats = channel.get("statistics", {})
+    subscribers = _int(stats.get("subscriberCount"))
+    uploads = channel["contentDetails"]["relatedPlaylists"]["uploads"]
+
+    conn = connect(db_path)
+    profile = get_or_create_profile(
+        conn,
+        "youtube",
+        handle,
+        mode="public",
+        external_id=channel_id,
+        label=snippet.get("title"),
+    )
+    add_account_snapshot(
+        conn,
+        "youtube",
+        profile_id=profile["id"],
+        followers=subscribers,
+        posts_count=_int(stats.get("videoCount")),
+        extra={"channel_id": channel_id, "title": snippet.get("title"), "mode": "public"},
+    )
+
+    video_ids = _fetch_video_ids(youtube, uploads, limit)
+    if verbose:
+        print(f"[youtube] canal publico {snippet.get('title') or handle}: {len(video_ids)} videos")
+
+    written = 0
+    for offset in range(0, len(video_ids), 50):
+        chunk = video_ids[offset : offset + 50]
+        response = (
+            youtube.videos()
+            .list(part="snippet,contentDetails,statistics", id=",".join(chunk), maxResults=50)
+            .execute()
+        )
+        for video in response.get("items", []):
+            vid = video["id"]
+            video_snippet = video.get("snippet", {})
+            vstats = video.get("statistics", {})
+            duration = parse_duration(video.get("contentDetails", {}).get("duration"))
+            fmt = "short" if duration and duration <= 60 else "video"
+
+            upsert_post(
+                conn,
+                {
+                    "id": f"youtube:{vid}",
+                    "profile_id": profile["id"],
+                    "platform": "youtube",
+                    "platform_id": vid,
+                    "posted_at": video_snippet.get("publishedAt"),
+                    "format": fmt,
+                    "title": video_snippet.get("title"),
+                    "text": (video_snippet.get("description") or "")[:4000],
+                    "url": f"https://youtu.be/{vid}",
+                    "duration_s": duration,
+                    "extra": {
+                        "tags": (video_snippet.get("tags") or [])[:25],
+                        "mode": "public",
+                    },
+                },
+            )
+            # Sem Analytics API nao existem impressoes, CTR, retencao ou audiencia.
+            add_metric_snapshot(
+                conn,
+                f"youtube:{vid}",
+                views=_int(vstats.get("viewCount")),
+                likes=_int(vstats.get("likeCount")),
+                comments=_int(vstats.get("commentCount")),
+                followers=subscribers,
+            )
+            written += 1
+
+    conn.commit()
+    conn.close()
+    if verbose:
+        print(f"[youtube] {written} videos publicos gravados (perfil {profile['id']})")
+    return {
+        "posts": written,
+        "videos_seen": len(video_ids),
+        "profile": profile["id"],
+        "mode": "public",
+    }
+
+
+def _collect_owned(
+    limit: int | None = None,
+    db_path: str | Path | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
     creds = get_credentials()
     youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
     analytics = build("youtubeAnalytics", "v2", credentials=creds, cache_discovery=False)
-    conn = connect(db_path)
 
-    channel_resp = youtube.channels().list(part="snippet,contentDetails,statistics", mine=True).execute()
+    channel_resp = youtube.channels().list(
+        part="snippet,contentDetails,statistics", mine=True
+    ).execute()
     items = channel_resp.get("items") or []
     if not items:
         raise SystemExit("Nenhum canal do YouTube encontrado para esta conta Google.")
     channel = items[0]
     channel_id = channel["id"]
+    snippet = channel.get("snippet", {})
     uploads = channel["contentDetails"]["relatedPlaylists"]["uploads"]
     stats = channel.get("statistics", {})
     subscribers = _int(stats.get("subscriberCount"))
 
+    conn = connect(db_path)
+    profile = get_or_create_profile(
+        conn,
+        "youtube",
+        snippet.get("customUrl") or channel_id,
+        mode="owned",
+        external_id=channel_id,
+        label=snippet.get("title"),
+    )
+
     add_account_snapshot(
         conn,
         "youtube",
+        profile_id=profile["id"],
         followers=subscribers,
         posts_count=_int(stats.get("videoCount")),
-        extra={"channel_id": channel_id, "title": channel.get("snippet", {}).get("title")},
+        extra={"channel_id": channel_id, "title": snippet.get("title"), "mode": "owned"},
     )
 
     video_ids = _fetch_video_ids(youtube, uploads, limit)
     if verbose:
-        print(f"[youtube] {len(video_ids)} videos encontrados")
+        print(f"[youtube] {len(video_ids)} videos encontrados (perfil {profile['id']})")
 
     start, end = _date_range()
 
@@ -248,11 +427,12 @@ def collect(
             vid = row[index["video"]]
             bucket = row[index[dimension]]
             breakdowns.setdefault(vid, {}).setdefault(dimension, {})
-            breakdowns[vid][dimension][bucket] = breakdowns[vid][dimension].get(bucket, 0) + (row[index["views"]] or 0)
+            breakdowns[vid][dimension][bucket] = breakdowns[vid][dimension].get(bucket, 0) + (
+                row[index["views"]] or 0
+            )
 
     # Detalhes dos videos (Data API) e gravacao.
     written = 0
-    followers_for_snapshot = subscribers
     for offset in range(0, len(video_ids), 50):
         chunk = video_ids[offset : offset + 50]
         response = (
@@ -262,7 +442,7 @@ def collect(
         )
         for video in response.get("items", []):
             vid = video["id"]
-            snippet = video.get("snippet", {})
+            video_snippet = video.get("snippet", {})
             vstats = video.get("statistics", {})
             duration = parse_duration(video.get("contentDetails", {}).get("duration"))
             fmt = "short" if duration and duration <= 60 else "video"
@@ -271,15 +451,16 @@ def collect(
                 conn,
                 {
                     "id": f"youtube:{vid}",
+                    "profile_id": profile["id"],
                     "platform": "youtube",
                     "platform_id": vid,
-                    "posted_at": snippet.get("publishedAt"),
+                    "posted_at": video_snippet.get("publishedAt"),
                     "format": fmt,
-                    "title": snippet.get("title"),
-                    "text": (snippet.get("description") or "")[:4000],
+                    "title": video_snippet.get("title"),
+                    "text": (video_snippet.get("description") or "")[:4000],
                     "url": f"https://youtu.be/{vid}",
                     "duration_s": duration,
-                    "extra": {"tags": (snippet.get("tags") or [])[:25]},
+                    "extra": {"tags": (video_snippet.get("tags") or [])[:25], "mode": "owned"},
                 },
             )
 
@@ -290,7 +471,7 @@ def collect(
                 metrics["likes"] = _int(vstats.get("likeCount"))
             if metrics.get("comments") is None:
                 metrics["comments"] = _int(vstats.get("commentCount"))
-            metrics["followers"] = followers_for_snapshot
+            metrics["followers"] = subscribers
 
             add_metric_snapshot(conn, f"youtube:{vid}", **metrics)
 
@@ -305,7 +486,13 @@ def collect(
     try:
         headers, rows = _query_all(analytics, "views", "hour", window_start, end)
         index = {header["name"]: i for i, header in enumerate(headers)}
-        add_audience(conn, "youtube", "hour", {str(int(row[index["hour"]])): row[index["views"]] for row in rows})
+        add_audience(
+            conn,
+            "youtube",
+            "hour",
+            {str(int(row[index["hour"]])): row[index["views"]] for row in rows},
+            profile_id=profile["id"],
+        )
     except HttpError:
         if verbose:
             print("[youtube] perfil de horarios indisponivel")
@@ -316,13 +503,27 @@ def collect(
         per_weekday: dict[int, float] = {}
         for row in rows:
             day = datetime.fromisoformat(str(row[index["day"]])).date()
-            per_weekday[day.weekday()] = per_weekday.get(day.weekday(), 0) + (row[index["views"]] or 0)
-        add_audience(conn, "youtube", "weekday", {str(k): v for k, v in per_weekday.items()})
+            per_weekday[day.weekday()] = per_weekday.get(day.weekday(), 0) + (
+                row[index["views"]] or 0
+            )
+        add_audience(
+            conn,
+            "youtube",
+            "weekday",
+            {str(k): v for k, v in per_weekday.items()},
+            profile_id=profile["id"],
+        )
     except HttpError:
         if verbose:
             print("[youtube] perfil por dia da semana indisponivel")
 
     conn.commit()
+    conn.close()
     if verbose:
-        print(f"[youtube] {written} videos gravados no banco")
-    return {"posts": written, "videos_seen": len(video_ids)}
+        print(f"[youtube] {written} videos gravados no banco (perfil {profile['id']})")
+    return {
+        "posts": written,
+        "videos_seen": len(video_ids),
+        "profile": profile["id"],
+        "mode": "owned",
+    }
